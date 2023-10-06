@@ -1,26 +1,37 @@
 library(tidyverse)
 library(tidymodels)
 library(vroom)
+library(poissonreg)
 
 bike_train <- vroom('C:/BYU/2023(5) Fall/STAT 348/KaggleBikeShare/train.csv',
               show_col_types = FALSE) %>%
-  select(datetime, season, weather, temp, humidity, windspeed, count) %>%
+  select(datetime, season, holiday, workingday, weather, temp, humidity, windspeed, count) %>%
   mutate(count= log(count))
 
 bike_test <-vroom('C:/BYU/2023(5) Fall/STAT 348/KaggleBikeShare/test.csv',
                    show_col_types = FALSE)
-bike_train <- bike_train %>%
-  mutate(weather = replace(weather, weather == 4, 3))
 
 my_recipe <- recipe(count~., bike_train) %>%
   step_time(datetime, features=c("hour"), keep_original_cols = F) %>% #creates new column with hour as variable
+  step_mutate(season = as.factor(season),
+              holiday = as.factor(holiday),
+              weather = replace(weather, weather == 4, 3),
+              weather= as.factor(weather),
+              workingday= as.factor(workingday),
+              hour= as.factor(datetime_hour)
+              )%>%
   step_dummy(all_nominal_predictors())%>%
   step_normalize(all_numeric_predictors())
 prepped_recipe <- prep(my_recipe)
 bake(prepped_recipe, new_data= bike_train)
 
 
+untunedModel <- control_stack_Grid()
+tunedModel <- control_Stack_resamples()
+
+#######################
 ###Linear Regression###
+#######################
 
 my_mod <- linear_reg() %>% # type of model
   set_engine("lm") # Engine = what r function to use
@@ -38,7 +49,7 @@ bike_pred<-cbind(bike_test1$datetime, bike_pred) %>%
 #vroom_write(bike_pred, "bike_pred.csv", delim = ",")
 ###Poisson Regression###
 
-library(poissonreg)
+
 pois_mod <- poisson_reg() %>%
   set_engine("glm")
 
@@ -152,4 +163,71 @@ bike_predictions <- predict(final_wf, new_data=bike_test) %>%
   mutate(datetime=as.character(format(datetime))) %>%
   mutate(count= exp(count))
 
+#vroom_write(x=bike_predictions, file="./TestPreds.csv", delim=",")
+
+### Random Forrests###
+my_mod <- rand_forest(mtry = tune(),
+                      min_n= tune(),
+                      trees = 500)%>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+tuning_grid <- grid_regular(mtry(c(1,(ncol(bike_train)-1))), min_n(), levels = 3)
+
+randf_wf <- workflow() %>%
+  add_recipe(my_recipe) %>%
+  add_model(my_mod) 
+
+folds <- vfold_cv(bike_train, v = 5, repeats =1)
+CV_results <- randf_wf %>%
+  tune_grid(resamples=folds,
+            grid=tuning_grid,
+            metrics=metric_set(rmse, mae, rsq))
+
+collect_metrics(CV_results) %>%
+  filter(.metric=="rmse")
+
+bestTune <- CV_results %>%
+  select_best("rmse")
+final_wf <- randf_wf %>%
+  finalize_workflow(bestTune) %>%
+  fit(data = bike_train)
+
+final_wf %>% 
+  predict(new_data = bike_train)
+
+
+bike_predictions <- predict(final_wf, new_data=bike_test) %>%
+  bind_cols(., bike_test) %>% #Bind predictions with test data
+  select(datetime, .pred) %>% #Just keep datetime and predictions
+  rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
+  mutate(count=pmax(0, count)) %>% #pointwise max of (0, prediction)
+  mutate(datetime=as.character(format(datetime))) %>%
+  mutate(count= exp(count))
+
 vroom_write(x=bike_predictions, file="./TestPreds.csv", delim=",")
+
+###################
+###stacked Model###
+###################
+
+
+bike_stack <- stacks() %>%
+  add_candidates(linreg_folds_fit)%>%
+  add_candidates(penReg_folds_fit) %>%
+  add_candidates(tree_folds_fit)
+ass_tibble(bike_stack)
+
+fitted_bike_stack <- bike_Stack %>%
+  blend_predictions() %>%
+  fit_members()
+
+collect_parameters(fitted_bike_Stack, "tree_folds_fit")
+
+stacked_predictions <- predict(fitted_bike_stack, new_data=bike_test) %>%
+  bind_cols(., bike_test) %>% #Bind predictions with test data
+  select(datetime, .pred) %>% #Just keep datetime and predictions
+  rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
+  mutate(count=pmax(0, count)) %>% #pointwise max of (0, prediction)
+  mutate(datetime=as.character(format(datetime))) %>%
+  mutate(count= exp(count))
